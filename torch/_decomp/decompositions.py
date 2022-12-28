@@ -1970,6 +1970,31 @@ def uniform(
     )
 
 
+@register_decomposition(aten.bernoulli_)
+def bernoulli_(self, p=0.5):
+    return self.copy_(torch.rand_like(self, dtype=torch.float32) < p)
+    
+    
+@register_decomposition(aten.uniform_)
+def uniform_(self, low=0, high=1):
+    return self.copy_((high - low) * torch.rand_like(self) + low)
+    
+
+@register_decomposition([aten.normal_])
+def normal_(self, mean=0, std=1):
+    return self.copy_(std * torch.randn_like(self) + mean)
+    
+
+@register_decomposition([aten.log_normal_])
+def log_normal_(self, mean=1, std=2):
+    return self.copy_(torch.exp(std * torch.randn_like(self) + mean))
+    
+
+@register_decomposition([aten.exponential_])
+def exponential_(self, rate=1):
+    return -1 * (1/rate) * torch.log(1 - torch.rand_like(self))
+    
+    
 # aten/src/ATen/native/UpSample.cpp compute_output_size
 def upsample_compute_output_size(input_size, output_size, scale_factors):
     spatial_dimensions = len(input_size) - 2
