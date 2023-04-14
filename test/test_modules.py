@@ -7,6 +7,7 @@ import tempfile
 from operator import methodcaller
 
 import torch
+from torch.testing._internal.common_cuda import with_tf32_off
 from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests, onlyCUDA, toleranceOverride, tol, skipMeta)
 from torch.testing._internal.common_modules import module_db, modules, TrainEvalMode
@@ -381,12 +382,13 @@ class TestModule(TestCase):
                     grad_output = default_output.clone().detach_().normal_()
                     default_output.backward(grad_output, retain_graph=True)
                 else:
-                    grad_output = tuple(self._traverse_obj(o, lambda o: o.clone().detach_().normal_())
+                    grad_output = tuple(self._traverse_obj(o, lambda o: o.clone().detach_().normal_() if o.requires_grad else None)
                                         for o in default_output)
                     flattened_default_output, _ = torch.utils._pytree.tree_flatten(default_output)
                     flattened_grad_output, _ = torch.utils._pytree.tree_flatten(grad_output)
                     for o, g_o in zip(flattened_default_output, flattened_grad_output):
-                        o.backward(g_o, retain_graph=True)
+                        if (o.requires_grad):
+                            o.backward(g_o, retain_graph=True)
 
             default_input_args_grad, default_input_kwargs_grad = deepcopy(self._get_grads((input_args, input_kwargs)))
             default_param_grad = deepcopy([p.grad for p in m.parameters()])
@@ -412,7 +414,8 @@ class TestModule(TestCase):
                         flattened_out, _ = torch.utils._pytree.tree_flatten(out)
                         flattened_g_out_copy, _ = torch.utils._pytree.tree_flatten(g_out_copy)
                         for o, g_o in zip(flattened_out, flattened_g_out_copy):
-                            o.backward(g_o, retain_graph=True)
+                            if o.requires_grad:
+                                o.backward(g_o, retain_graph=True)
 
                 input_args_grad, input_kwargs_grad = self._get_grads((in_args, in_kwargs))
                 self.assertEqual(out, default_output)
@@ -488,6 +491,7 @@ class TestModule(TestCase):
         self._test_gradients_helper(device, dtype, module_info, training, gradgradcheck)
 
     @onlyCUDA
+    @with_tf32_off  # Turn off TF32 to compute at full precision https://github.com/pytorch/pytorch/issues/86798
     @toleranceOverride({torch.float32: tol(5e-2, 0),
                         torch.float64: tol(4e-4, 0)})
     @modules(module_db)
@@ -496,7 +500,7 @@ class TestModule(TestCase):
         # TODO: RNN / GRU / LSTM don't support backwards on eval mode for cuDNN; skip this in a
         # nicer way for eval mode only.
         # See https://github.com/pytorch/pytorch/issues/79161
-        rnn_modules = set([torch.nn.RNN, torch.nn.GRU, torch.nn.LSTM])
+        rnn_modules = {torch.nn.RNN, torch.nn.GRU, torch.nn.LSTM}
         if (module_info.module_cls in rnn_modules
                 and not training
                 and 'cuda' in device
@@ -578,7 +582,8 @@ class TestModule(TestCase):
                     flatten_cpu_outputs, _ = torch.utils._pytree.tree_flatten(cpu_outputs)
                     flatten_gpu_outputs, _ = torch.utils._pytree.tree_flatten(gpu_outputs)
                     for cpu_output, gpu_output in zip(flatten_cpu_outputs, flatten_gpu_outputs):
-                        check_backward(cpu_output, gpu_output)
+                        if cpu_output.requires_grad:
+                            check_backward(cpu_output, gpu_output)
 
     @skipIfMps
     @modules(module_db)

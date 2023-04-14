@@ -135,7 +135,7 @@ ListElementReference<T, Iterator>& ListElementReference<T, Iterator>::operator=(
 
 template<class T, class Iterator>
 ListElementReference<T, Iterator>& ListElementReference<T, Iterator>::operator=(const T& new_value) && {
-  *iterator_ = c10::detail::ListElementFrom<T>::from(std::move(new_value));
+  *iterator_ = c10::detail::ListElementFrom<T>::from(new_value);
   return *this;
 }
 
@@ -348,5 +348,13 @@ TypePtr List<T>::elementType() const {
 template <class T>
 void List<T>::unsafeSetElementType(TypePtr t) {
   impl_->elementType = std::move(t);
+}
+
+namespace impl {
+
+inline const IValue* ptr_to_first_element(const GenericList& list) {
+  return &list.impl_->list[0];
+}
+
 }
 }

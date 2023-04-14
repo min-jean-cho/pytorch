@@ -1,9 +1,9 @@
 import collections
 import contextlib
-import dataclasses
 import functools
 import importlib
 import inspect
+import itertools
 import random
 import types
 from typing import Dict, List
@@ -11,12 +11,19 @@ from typing import Dict, List
 import torch.nn
 
 from .. import variables
+from ..allowed_functions import is_allowed
 from ..exc import unimplemented
 from ..guards import GuardBuilder
 from ..source import AttrSource, ODictGetItemSource, RandomValueSource
-from ..utils import is_namedtuple_cls, namedtuple_fields
+from ..utils import (
+    get_custom_getattr,
+    is_namedtuple_cls,
+    istype,
+    namedtuple_fields,
+    object_has_getattribute,
+)
 from .base import MutableLocal, VariableTracker
-from .misc import NullContextVariable
+from .ctx_manager import NullContextVariable
 
 
 class UserDefinedVariable(VariableTracker):
@@ -31,21 +38,27 @@ class UserDefinedClassVariable(UserDefinedVariable):
     def as_python_constant(self):
         return self.value
 
+    def python_type(self):
+        return type(self.value)
+
     def var_getattr(self, tx, name: str) -> "VariableTracker":
         from . import ConstantVariable
         from .builder import VariableBuilder
 
         options = VariableTracker.propagate(self)
-        source = AttrSource(self.source, name) if self.source else None
+        source = AttrSource(self.source, name) if self.source is not None else None
         try:
             obj = inspect.getattr_static(self.value, name)
         except AttributeError:
             obj = None
-
         if isinstance(obj, staticmethod):
-            return variables.UserFunctionVariable(obj.__get__(self.value), **options)
+            return variables.UserFunctionVariable(
+                obj.__get__(self.value), source=source, **options
+            )
         elif isinstance(obj, classmethod):
-            return variables.UserMethodVariable(obj.__func__, self, **options)
+            return variables.UserMethodVariable(
+                obj.__func__, self, source=source, **options
+            )
 
         if name in getattr(self.value, "__dict__", {}) or ConstantVariable.is_literal(
             obj
@@ -55,7 +68,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
             elif ConstantVariable.is_literal(obj):
                 return ConstantVariable(obj, **options)
 
-        return super(UserDefinedClassVariable, self).var_getattr(tx, name)
+        return super().var_getattr(tx, name)
 
     def call_method(
         self,
@@ -90,10 +103,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
 
         options = VariableTracker.propagate(self, args, kwargs.values())
 
-        if self.value in (
-            contextlib.nullcontext,
-            torch.autograd.profiler.profile,
-        ):
+        if self.value is contextlib.nullcontext:
             return NullContextVariable(**options)
         elif is_namedtuple_cls(self.value):
             fields = namedtuple_fields(self.value)
@@ -112,9 +122,23 @@ class UserDefinedClassVariable(UserDefinedVariable):
             and self.source
         ):
             var = tx.output.side_effects.track_object_new(
-                self.source, self.value, UserDefinedObjectVariable, options
+                self.source,
+                self.value,
+                variables.UnspecializedNNModuleVariable
+                if issubclass(self.value, torch.nn.Module)
+                else UserDefinedObjectVariable,
+                options,
             )
-            return var.add_options(var.call_method(tx, "__init__", args, kwargs))
+            if (
+                inspect.getattr_static(self.value, "__init__", None)
+                is torch.nn.Module.__init__
+            ):
+                tx.output.side_effects.store_attr(
+                    var, "__call_nn_module_init", variables.ConstantVariable(True)
+                )
+                return var
+            else:
+                return var.add_options(var.call_method(tx, "__init__", args, kwargs))
         elif variables.DataClassVariable.is_matching_cls(self.value):
             options["mutable_local"] = MutableLocal()
             return variables.DataClassVariable.create(self.value, args, kwargs, options)
@@ -133,7 +157,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
     """
 
     def __init__(self, value, value_type=None, **kwargs):
-        super(UserDefinedObjectVariable, self).__init__(**kwargs)
+        super().__init__(**kwargs)
         self.value = value
         self.value_type = value_type or type(value)
         assert type(value) is self.value_type
@@ -179,7 +203,6 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                 method = inspect.getattr_static(type(self.value), name)
             except AttributeError:
                 method = None
-
             if method is object.__init__:
                 return ConstantVariable(None, **options)
 
@@ -190,6 +213,18 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                 assert all(map(ConstantVariable.is_literal, keys))
                 return TupleVariable(
                     [ConstantVariable(k, **options) for k in keys], **options
+                ).add_guard(self.source.make_guard(GuardBuilder.ODICT_KEYS))
+
+            if (
+                method is collections.OrderedDict.__contains__
+                and len(args) == 1
+                and isinstance(args[0], ConstantVariable)
+                and inspect.getattr_static(type(self.value), "keys")
+                is collections.OrderedDict.keys
+            ):
+                assert not kwargs
+                return ConstantVariable(
+                    args[0].as_python_constant() in self.value, **options
                 ).add_guard(self.source.make_guard(GuardBuilder.ODICT_KEYS))
 
             if (
@@ -216,10 +251,15 @@ class UserDefinedObjectVariable(UserDefinedVariable):
 
             # check for methods implemented in C++
             if isinstance(method, types.FunctionType):
-                # TODO(jansel): add a guard to check for monkey patching?
-                return UserMethodVariable(method, self, **options).call_function(
-                    tx, args, kwargs
+                source = (
+                    None
+                    if self.source is None
+                    else AttrSource(AttrSource(self.source, "__class__"), name)
                 )
+                # TODO(jansel): add a guard to check for monkey patching?
+                return UserMethodVariable(
+                    method, self, source=source, **options
+                ).call_function(tx, args, kwargs)
 
         return super().call_method(tx, name, args, kwargs)
 
@@ -243,39 +283,72 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             args = [x.as_python_constant() for x in args]
             kwargs = {k: v.as_python_constant() for k, v in kwargs.items()}
             random_call_index = len(tx.random_calls)
-            if random_call_index == 0:
-                tx.output.initial_random_state = random.getstate()
             example_value = self.value(*args, **kwargs)
             source = RandomValueSource(random_call_index)
             tx.random_calls.append((self.value, args, kwargs))
             return VariableBuilder(tx, source).wrap_unspecialized_primitive(
                 example_value
             )
+        elif istype(self.value, types.MethodType):
+            func = self.value.__func__
+            obj = self.value.__self__
+            if (
+                func is torch.utils._contextlib._DecoratorContextManager.clone
+                and is_allowed(obj.__class__)
+                and not (args or kwargs)
+            ):
+                return variables.TorchVariable(obj.__class__).call_function(
+                    tx, args, kwargs
+                )
+        elif (
+            istype(self.value, functools.partial)
+            and is_allowed(self.value.func)
+            and all(
+                variables.ConstantVariable.is_literal(v)
+                for v in itertools.chain(self.value.args, self.value.keywords.values())
+            )
+        ):
+            options = VariableTracker.propagate(self, args, kwargs.values())
+            options.setdefault("guards", set())
+            if self.source:
+                options["guards"].add(
+                    AttrSource(self.source, "func").make_guard(GuardBuilder.ID_MATCH)
+                )
+                options["guards"].add(
+                    AttrSource(self.source, "args").make_guard(
+                        GuardBuilder.CONSTANT_MATCH
+                    )
+                )
+                options["guards"].add(
+                    AttrSource(self.source, "keywords").make_guard(
+                        GuardBuilder.CONSTANT_MATCH
+                    )
+                )
+
+            partial_args = [variables.ConstantVariable(v) for v in self.value.args]
+            partial_args.extend(args)
+            partial_kwargs = {
+                k: variables.ConstantVariable(v) for k, v in self.value.keywords.items()
+            }
+            partial_kwargs.update(kwargs)
+            return variables.TorchVariable(self.value.func, **options).call_function(
+                tx, partial_args, partial_kwargs
+            )
 
         return super().call_function(tx, args, kwargs)
 
     def _check_for_getattribute(self):
-        try:
-            if isinstance(
-                inspect.getattr_static(type(self.value), "__getattribute__"),
-                types.FunctionType,
-            ):
-                unimplemented("UserDefinedObjectVariable with custom __getattribute__")
-        except AttributeError:
-            pass
+        if object_has_getattribute(self.value):
+            unimplemented("UserDefinedObjectVariable with custom __getattribute__")
 
     def _check_for_getattr(self):
-        try:
-            getattr_fn = inspect.getattr_static(type(self.value), "__getattr__")
-        except AttributeError:
-            getattr_fn = None
-        if getattr_fn is torch.nn.Module.__getattr__:
-            # ignore this case of getattr
-            getattr_fn = None
-        return getattr_fn
+        return get_custom_getattr(self.value)
 
     def _getattr_static(self, name):
-        if isinstance(self.value, (dataclasses.Field, torch.nn.Module)):
+        if (
+            isinstance(self.value, torch.nn.Module)
+            or "__slots__" in self.value.__class__.__dict__
+        ):
             # getattr_static doesn't work on these
             subobj = getattr(self.value, name)
         else:
@@ -295,17 +368,28 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         try:
             subobj = self._getattr_static(name)
         except AttributeError:
+            subobj = None
             if isinstance(getattr_fn, types.FunctionType):
                 return variables.UserMethodVariable(
-                    getattr_fn, self, **options
+                    getattr_fn, self, source=source, **options
                 ).call_function(tx, [ConstantVariable(name)], {})
             elif getattr_fn is not None:
                 unimplemented("UserDefined with non-function __getattr__")
 
         if isinstance(subobj, property):
             return variables.UserMethodVariable(
-                subobj.fget, self, **options
+                subobj.fget, self, source=source, **options
             ).call_function(tx, [], {})
+        elif isinstance(subobj, staticmethod):
+            return variables.UserFunctionVariable(
+                subobj.__get__(self.value), source=source, **options
+            )
+        elif isinstance(subobj, classmethod):
+            return variables.UserMethodVariable(
+                subobj.__func__, self, source=source, **options
+            )
+        elif isinstance(subobj, types.FunctionType):
+            return variables.UserMethodVariable(subobj, self, source=source, **options)
 
         if (
             name in getattr(value, "__dict__", {})
@@ -342,7 +426,7 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                 )
 
             return VariableBuilder(tx, source)(subobj).add_options(options)
-
+        options["source"] = source
         if isinstance(
             subobj,
             (
@@ -351,17 +435,12 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                 torch.distributions.constraints.Constraint,
             ),
         ):
-            return UserDefinedObjectVariable(subobj, source=source, **options)
-
-        if isinstance(subobj, staticmethod):
-            return variables.UserFunctionVariable(subobj.__get__(self.value), **options)
-        elif isinstance(subobj, classmethod):
-            return variables.UserMethodVariable(subobj.__func__, self, **options)
+            return UserDefinedObjectVariable(subobj, **options)
 
         if name == "__class__":
-            return UserDefinedClassVariable(type(self.value), source=source, **options)
+            return UserDefinedClassVariable(type(self.value), **options)
 
-        return variables.GetAttrVariable(self, name, source=source, **options)
+        return variables.GetAttrVariable(self, name, **options)
 
     def call_hasattr(self, tx, name: str) -> "VariableTracker":
         if not self.source:

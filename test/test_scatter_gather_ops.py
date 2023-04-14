@@ -164,8 +164,10 @@ class TestScatterGather(TestCase):
 
     @dtypes(torch.float16, torch.float32, torch.complex64)
     def test_scatter_(self, device, dtype):
-        self._test_scatter_base(torch.Tensor.scatter_, device=device, dtype=dtype,
-                                is_scalar=False, reduction=None)
+        for deterministic in [False, True]:
+            with DeterministicGuard(deterministic):
+                self._test_scatter_base(torch.Tensor.scatter_, device=device, dtype=dtype,
+                                        is_scalar=False, reduction=None)
 
     @dtypes(torch.float16, torch.float32, torch.complex64)
     def test_scatter__scalar(self, device, dtype):
@@ -207,9 +209,11 @@ class TestScatterGather(TestCase):
     @dtypes(*get_all_dtypes(include_half=True, include_bfloat16=True, include_bool=False))
     def test_scatter_reduce_sum(self, device, dtype):
         for include_self in (True, False):
-            self._test_scatter_base(torch.Tensor.scatter_reduce_, device=device, dtype=dtype,
-                                    is_scalar=False, reduction='sum', unique_indices=False,
-                                    include_self=include_self)
+            for deterministic in [False, True]:
+                with DeterministicGuard(deterministic):
+                    self._test_scatter_base(torch.Tensor.scatter_reduce_, device=device, dtype=dtype,
+                                            is_scalar=False, reduction='sum', unique_indices=False,
+                                            include_self=include_self)
 
     @dtypes(*get_all_dtypes(include_half=True, include_bfloat16=True))
     @dtypesIfCUDA(*get_all_dtypes(include_half=True, include_bfloat16=True, include_complex=False, include_bool=False))
@@ -223,9 +227,11 @@ class TestScatterGather(TestCase):
     @dtypesIfCUDA(*get_all_dtypes(include_half=True, include_bfloat16=True, include_complex=False, include_bool=False))
     def test_scatter_reduce_mean(self, device, dtype):
         for include_self in (True, False):
-            self._test_scatter_base(torch.Tensor.scatter_reduce_, device=device, dtype=dtype,
-                                    is_scalar=False, reduction='mean', unique_indices=False,
-                                    include_self=include_self)
+            for deterministic in [False, True]:
+                with DeterministicGuard(deterministic):
+                    self._test_scatter_base(torch.Tensor.scatter_reduce_, device=device, dtype=dtype,
+                                            is_scalar=False, reduction='mean', unique_indices=False,
+                                            include_self=include_self)
 
     @dtypes(*get_all_dtypes(include_half=True, include_bfloat16=True, include_complex=False))
     @dtypesIfCUDA(*get_all_dtypes(include_half=True, include_bfloat16=True, include_complex=False, include_bool=False))
@@ -299,6 +305,34 @@ class TestScatterGather(TestCase):
                     out = input.scatter_reduce(0, idx, src, reduce=reduce, include_self=include_self)
                     out2 = input2.scatter_reduce(0, idx2, src, reduce=reduce, include_self=include_self)
                     self.assertEqual(out, out2)
+
+        helper([50, 17], 100)
+        helper([50, 1], 100)
+        helper([50, 8, 7], 100)
+        helper([50, 3, 4, 5], 100)
+
+    @onlyCPU
+    @dtypes(torch.float32, torch.float64, torch.bfloat16)
+    def test_gather_expanded_index(self, device, dtype):
+        def helper(input_size, idx_size):
+            input = torch.randn(input_size, device=device).to(dtype=dtype)
+            input2 = input.clone()
+
+            shape = [1] * len(input_size)
+            shape[0] = idx_size
+            dim_size = input_size[0]
+            idx = torch.randint(0, dim_size, shape)
+
+            # Test the fast path on gather when index is expanded
+            expanded_shape = input_size
+            expanded_shape[0] = idx_size
+            idx = idx.expand(expanded_shape)
+            idx2 = idx.contiguous()
+
+            out = torch.gather(input, 0, idx)
+            out2 = torch.gather(input2, 0, idx2)
+
+            self.assertEqual(out, out2)
 
         helper([50, 17], 100)
         helper([50, 1], 100)

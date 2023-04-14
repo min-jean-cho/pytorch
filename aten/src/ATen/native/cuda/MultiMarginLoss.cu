@@ -16,19 +16,18 @@
 #include <ATen/ops/multi_margin_loss_backward_native.h>
 #endif
 
-namespace at {
-namespace native {
+namespace at::native {
 namespace {
 constexpr int MULTIMARGIN_THREADS = 128;
 
 template <int P, typename scalar_t>
 __global__ void MultiMarginLoss_forward_kernel(
-    scalar_t *output, scalar_t *input, int64_t *target, scalar_t *weights,
+    scalar_t *output, const scalar_t *input, const int64_t *target, const scalar_t *weights,
     int nframe, int dim, bool sizeAverage, scalar_t margin) {
   using acc_t = at::acc_type<scalar_t, true>;
   __shared__ acc_t buffer[MULTIMARGIN_THREADS];
   int k = blockIdx.x;
-  scalar_t *input_k = input + k*dim;
+  const scalar_t *input_k = input + k*dim;
   scalar_t *output_k = output + k;
   int target_k = static_cast<int>(target[k]);
   CUDA_KERNEL_ASSERT(target_k >= 0 && target_k < dim && "target index is out of bounds");
@@ -68,18 +67,18 @@ __global__ void MultiMarginLoss_forward_kernel(
 
 template <int P, typename scalar_t>
 __global__ void MultiMarginLoss_backward_kernel(
-    scalar_t *gradInput, scalar_t *gradOutput, scalar_t *input, int64_t *target,
-    scalar_t *weights, int nframe, int dim, bool sizeAverage, scalar_t margin,
+    scalar_t *gradInput, const scalar_t *gradOutput, const scalar_t *input, const int64_t *target,
+    const scalar_t *weights, int nframe, int dim, bool sizeAverage, scalar_t margin,
     bool reduce) {
   using acc_t = at::acc_type<scalar_t, true>;
   __shared__ acc_t buffer[MULTIMARGIN_THREADS];
   int k = blockIdx.x;
-  scalar_t *input_k = input + k*dim;
+  const scalar_t *input_k = input + k*dim;
   scalar_t *gradInput_k = gradInput + k*dim;
   int target_k = static_cast<int>(target[k]);
   scalar_t input_target_k = input_k[target_k];
 
-  scalar_t *gradOutput_k = gradOutput;
+  const scalar_t *gradOutput_k = gradOutput;
   if (!reduce) {
     gradOutput_k += k;
   }
@@ -184,10 +183,10 @@ Tensor& multi_margin_loss_cuda_out(
       dim3 threads(MULTIMARGIN_THREADS);
       if (p == 1) {
         MultiMarginLoss_forward_kernel<1> <<<blocks, threads, 0, stream>>>(
-            out.data_ptr<scalar_t>(),
-            input.data_ptr<scalar_t>(),
-            target.data_ptr<int64_t>(),
-            weights.defined() ? weights.data_ptr<scalar_t>() : nullptr,
+            out.mutable_data_ptr<scalar_t>(),
+            input.const_data_ptr<scalar_t>(),
+            target.const_data_ptr<int64_t>(),
+            weights.defined() ? weights.const_data_ptr<scalar_t>() : nullptr,
             1,
             input.dim() < 1 ? input.numel() : input.sizes()[0],
             reduction == at::Reduction::Mean,
@@ -195,10 +194,10 @@ Tensor& multi_margin_loss_cuda_out(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
       } else if (p == 2) {
         MultiMarginLoss_forward_kernel<2> <<<blocks, threads, 0, stream>>>(
-            out.data_ptr<scalar_t>(),
-            input.data_ptr<scalar_t>(),
-            target.data_ptr<int64_t>(),
-            weights.defined() ? weights.data_ptr<scalar_t>() : nullptr,
+            out.mutable_data_ptr<scalar_t>(),
+            input.const_data_ptr<scalar_t>(),
+            target.const_data_ptr<int64_t>(),
+            weights.defined() ? weights.const_data_ptr<scalar_t>() : nullptr,
             1,
             input.dim() < 1 ? input.numel() : input.sizes()[0],
             reduction == at::Reduction::Mean,
@@ -217,20 +216,20 @@ Tensor& multi_margin_loss_cuda_out(
       if (reduction == at::Reduction::None) {
         if (p == 1) {
           MultiMarginLoss_forward_kernel<1> <<<blocks, threads, 0, stream>>>(
-              out.data_ptr<scalar_t>(),
-              input.data_ptr<scalar_t>(),
-              target.data_ptr<int64_t>(),
-              weights.defined() ? weights.data_ptr<scalar_t>() : nullptr,
+              out.mutable_data_ptr<scalar_t>(),
+              input.const_data_ptr<scalar_t>(),
+              target.const_data_ptr<int64_t>(),
+              weights.defined() ? weights.const_data_ptr<scalar_t>() : nullptr,
               nframe, in_sizes[1],
               false,
               margin);
           C10_CUDA_KERNEL_LAUNCH_CHECK();
         } else if (p == 2) {
           MultiMarginLoss_forward_kernel<2> <<<blocks, threads, 0, stream>>>(
-              out.data_ptr<scalar_t>(),
-              input.data_ptr<scalar_t>(),
-              target.data_ptr<int64_t>(),
-              weights.defined() ? weights.data_ptr<scalar_t>() : nullptr,
+              out.mutable_data_ptr<scalar_t>(),
+              input.const_data_ptr<scalar_t>(),
+              target.const_data_ptr<int64_t>(),
+              weights.defined() ? weights.const_data_ptr<scalar_t>() : nullptr,
               nframe, in_sizes[1],
               false,
               margin);
@@ -240,20 +239,20 @@ Tensor& multi_margin_loss_cuda_out(
         auto tmp_output = at::empty({nframe}, input.options());
         if (p == 1) {
           MultiMarginLoss_forward_kernel<1> <<<blocks, threads, 0, stream>>>(
-              tmp_output.data_ptr<scalar_t>(),
-              input.data_ptr<scalar_t>(),
-              target.data_ptr<int64_t>(),
-              weights.defined() ? weights.data_ptr<scalar_t>() : nullptr,
+              tmp_output.mutable_data_ptr<scalar_t>(),
+              input.const_data_ptr<scalar_t>(),
+              target.const_data_ptr<int64_t>(),
+              weights.defined() ? weights.const_data_ptr<scalar_t>() : nullptr,
               nframe, in_sizes[1],
               reduction == Reduction::Mean,
               margin);
           C10_CUDA_KERNEL_LAUNCH_CHECK();
         } else if (p == 2) {
           MultiMarginLoss_forward_kernel<2> <<<blocks, threads, 0, stream>>>(
-              tmp_output.data_ptr<scalar_t>(),
-              input.data_ptr<scalar_t>(),
-              target.data_ptr<int64_t>(),
-              weights.defined() ? weights.data_ptr<scalar_t>() : nullptr,
+              tmp_output.mutable_data_ptr<scalar_t>(),
+              input.const_data_ptr<scalar_t>(),
+              target.const_data_ptr<int64_t>(),
+              weights.defined() ? weights.const_data_ptr<scalar_t>() : nullptr,
               nframe, in_sizes[1],
               reduction == Reduction::Mean,
               margin);
@@ -315,11 +314,11 @@ Tensor& multi_margin_loss_cuda_backward_out(
 
       if (p == 1) {
         MultiMarginLoss_backward_kernel<1> <<<blocks, threads, 0, stream>>>(
-            grad_input.data_ptr<scalar_t>(),
-            grad_output.data_ptr<scalar_t>(),
-            input.data_ptr<scalar_t>(),
-            target.data_ptr<int64_t>(),
-            weights.defined() ? weights.data_ptr<scalar_t>() : nullptr,
+            grad_input.mutable_data_ptr<scalar_t>(),
+            grad_output.const_data_ptr<scalar_t>(),
+            input.const_data_ptr<scalar_t>(),
+            target.const_data_ptr<int64_t>(),
+            weights.defined() ? weights.const_data_ptr<scalar_t>() : nullptr,
             1,
             input.dim() == 0 ? 1 : input.sizes()[0],
             reduction == at::Reduction::Mean,
@@ -328,11 +327,11 @@ Tensor& multi_margin_loss_cuda_backward_out(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
       } else if (p == 2) {
         MultiMarginLoss_backward_kernel<2> <<<blocks, threads, 0, stream>>>(
-            grad_input.data_ptr<scalar_t>(),
-            grad_output.data_ptr<scalar_t>(),
-            input.data_ptr<scalar_t>(),
-            target.data_ptr<int64_t>(),
-            weights.defined() ? weights.data_ptr<scalar_t>() : nullptr,
+            grad_input.mutable_data_ptr<scalar_t>(),
+            grad_output.const_data_ptr<scalar_t>(),
+            input.const_data_ptr<scalar_t>(),
+            target.const_data_ptr<int64_t>(),
+            weights.defined() ? weights.const_data_ptr<scalar_t>() : nullptr,
             1,
             input.dim() == 0 ? 1 : input.sizes()[0],
             reduction == at::Reduction::Mean,
@@ -350,11 +349,11 @@ Tensor& multi_margin_loss_cuda_backward_out(
 
       if (p == 1) {
         MultiMarginLoss_backward_kernel<1> <<<blocks, threads, 0, stream>>>(
-            grad_input.data_ptr<scalar_t>(),
-            grad_output.data_ptr<scalar_t>(),
-            input.data_ptr<scalar_t>(),
-            target.data_ptr<int64_t>(),
-            weights.defined() ? weights.data_ptr<scalar_t>() : nullptr,
+            grad_input.mutable_data_ptr<scalar_t>(),
+            grad_output.const_data_ptr<scalar_t>(),
+            input.const_data_ptr<scalar_t>(),
+            target.const_data_ptr<int64_t>(),
+            weights.defined() ? weights.const_data_ptr<scalar_t>() : nullptr,
             nframe, in_sizes[1],
             reduction == at::Reduction::Mean,
             margin,
@@ -362,11 +361,11 @@ Tensor& multi_margin_loss_cuda_backward_out(
         C10_CUDA_KERNEL_LAUNCH_CHECK();
       } else if (p == 2) {
         MultiMarginLoss_backward_kernel<2> <<<blocks, threads, 0, stream>>>(
-            grad_input.data_ptr<scalar_t>(),
-            grad_output.data_ptr<scalar_t>(),
-            input.data_ptr<scalar_t>(),
-            target.data_ptr<int64_t>(),
-            weights.defined() ? weights.data_ptr<scalar_t>() : nullptr,
+            grad_input.mutable_data_ptr<scalar_t>(),
+            grad_output.const_data_ptr<scalar_t>(),
+            input.const_data_ptr<scalar_t>(),
+            target.const_data_ptr<int64_t>(),
+            weights.defined() ? weights.const_data_ptr<scalar_t>() : nullptr,
             nframe, in_sizes[1],
             reduction == at::Reduction::Mean,
             margin,
@@ -386,10 +385,10 @@ Tensor multi_margin_loss_cuda_backward(
     const Tensor &grad_output, const Tensor &input, const Tensor &target,
     const Scalar &p, const Scalar &margin, const c10::optional<Tensor> &weights,
     int64_t reduction) {
-  auto grad_input = at::empty({}, input.options());
+  auto grad_input = at::empty({0}, input.options());
   multi_margin_loss_cuda_backward_out(
       grad_output, input, target, p, margin, weights, reduction, grad_input);
   return grad_input;
 }
 
-}}  // namespace at::native
+}  // namespace at::native

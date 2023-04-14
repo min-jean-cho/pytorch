@@ -3,7 +3,7 @@
 
 #ifdef CUDART_VERSION
 
-namespace at { namespace cuda {
+namespace at::cuda {
 namespace {
 
 void createCusolverDnHandle(cusolverDnHandle_t *handle) {
@@ -30,7 +30,7 @@ using CuSolverDnPoolType = DeviceThreadHandlePool<cusolverDnHandle_t, createCuso
 
 cusolverDnHandle_t getCurrentCUDASolverDnHandle() {
   int device;
-  AT_CUDA_CHECK(cudaGetDevice(&device));
+  AT_CUDA_CHECK(c10::cuda::GetDevice(&device));
 
   // Thread local PoolWindows are lazily-initialized
   // to avoid initialization issues that caused hangs on Windows.
@@ -47,6 +47,6 @@ cusolverDnHandle_t getCurrentCUDASolverDnHandle() {
   return handle;
 }
 
-}} // namespace at::cuda
+} // namespace at::cuda
 
 #endif // CUDART_VERSION

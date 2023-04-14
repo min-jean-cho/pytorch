@@ -4,9 +4,7 @@
 
 #include <sstream>
 
-namespace torch {
-namespace jit {
-namespace tensorexpr {
+namespace torch::jit::tensorexpr {
 
 CodeGen::CodeGen(
     StmtPtr stmt,
@@ -152,7 +150,7 @@ std::vector<std::pair<BufPtr, BufPtr>> AllocBufsWithMemReuse(
 
     // Release memory for buffers whose liveness range ends before the creation
     // time of this buf.
-    // TODO: optimize in-place opererations and copy operations
+    // TODO: optimize in-place operations and copy operations
     std::vector<BufPtr> buf_to_release;
     for (auto& mapped : buf_mem_map) {
       auto buf_mapped = mapped.first;
@@ -296,7 +294,7 @@ void CodeGen::allocIntermediateBufs() {
     if (!bufs_allocated.count(buf) && !interm_bufs.count(buf)) {
       interm_bufs.insert(buf);
 
-      // Identify the access stmts to each unallocated intermeiate buffer.
+      // Identify the access stmts to each unallocated intermediate buffer.
       auto range = BufLiveRange::liveRange(stmt_, buf);
       interm_buf_ranges.emplace(buf, range);
     }
@@ -311,7 +309,7 @@ void CodeGen::allocIntermediateBufs() {
       interm_bufs, interm_buf_ranges, bufs_external_allocs);
 
   // Insert memory allocation/mapping nodes.
-  if (buf_allocs.size() > 0) {
+  if (!buf_allocs.empty()) {
     auto stmt_new = insertAllocFree(buf_allocs, bufs_external_allocs, stmt_);
     set_stmt(stmt_new);
   }
@@ -319,6 +317,4 @@ void CodeGen::allocIntermediateBufs() {
   GRAPH_DEBUG("\nMemory Allocation:\n\n", *stmt(), "\n");
 }
 
-} // namespace tensorexpr
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::tensorexpr

@@ -23,8 +23,7 @@
 #include <sstream>
 #include <utility>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 // Controls whether graph source ranges are printed by default
 bool global_print_source_ranges = true;
@@ -995,6 +994,8 @@ void initPythonIRBindings(PyObject* module_) {
       .def_static("get", &IntType::get);
   py::class_<SymIntType, Type, SymIntTypePtr>(m, "SymIntType")
       .def_static("get", &SymIntType::get);
+  py::class_<SymBoolType, Type, SymBoolTypePtr>(m, "SymBoolType")
+      .def_static("get", &SymBoolType::get);
   py::class_<FloatType, Type, FloatTypePtr>(m, "FloatType")
       .def_static("get", &FloatType::get);
   py::class_<ComplexType, Type, ComplexTypePtr>(m, "ComplexType")
@@ -1059,6 +1060,10 @@ void initPythonIRBindings(PyObject* module_) {
   py::class_<FutureType, Type, FutureTypePtr>(m, "FutureType")
       .def(py::init([](TypePtr a) { return FutureType::create(std::move(a)); }))
       .def("getElementType", &FutureType::getElementType);
+
+  py::class_<AwaitType, Type, AwaitTypePtr>(m, "AwaitType")
+      .def(py::init([](TypePtr a) { return AwaitType::create(std::move(a)); }))
+      .def("getElementType", &AwaitType::getElementType);
 
   py::class_<ClassType, Type, ClassTypePtr>(m, "ClassType")
       .def(py::init([](const std::string& qualified_name) {
@@ -1145,5 +1150,4 @@ void initPythonIRBindings(PyObject* module_) {
             return g.graph_output_to_symbolic_shape_dim_;
           });
 }
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

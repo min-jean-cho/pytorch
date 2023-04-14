@@ -22,8 +22,7 @@
 
 #include <tuple>
 
-namespace at {
-namespace native {
+namespace at::native {
 
 namespace {
 
@@ -295,12 +294,12 @@ void slow_conv_dilated_all_cuda_template(
                 /*     n=*/nOutputPlane,
                 /*     k=*/columns.size(0),
                 /* alpha=*/static_cast<scalar_t>(1),
-                /*     A=*/columns.data_ptr<scalar_t>(),
+                /*     A=*/columns.const_data_ptr<scalar_t>(),
                 /*   lda=*/columns.size(1),
-                /*     B=*/weight.data_ptr<scalar_t>(),
+                /*     B=*/weight.const_data_ptr<scalar_t>(),
                 /*   ldb=*/columns.size(0),
                 /*  beta=*/static_cast<scalar_t>(1),
-                /*     C=*/output_n.data_ptr<scalar_t>(),
+                /*     C=*/output_n.mutable_data_ptr<scalar_t>(),
                 /*   ldc=*/columns.size(1));
 
           } else {
@@ -612,5 +611,4 @@ std::tuple<Tensor, Tensor, Tensor> slow_conv_dilated3d_backward_cuda(
 REGISTER_CUDA_DISPATCH(slow_conv_dilated2d_backward_stub, &slow_conv_dilated2d_backward_cuda);
 REGISTER_CUDA_DISPATCH(slow_conv_dilated3d_backward_stub, &slow_conv_dilated3d_backward_cuda);
 
-} // namespace native
-} // namespace at
+} // namespace at::native

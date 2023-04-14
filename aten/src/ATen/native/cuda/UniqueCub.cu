@@ -16,9 +16,7 @@
 #include <ATen/ops/empty.h>
 #endif
 
-namespace at {
-namespace native {
-namespace internal {
+namespace at::native::internal {
 
 namespace {
 
@@ -87,7 +85,7 @@ std::tuple<Tensor, Tensor, Tensor> compute_unique(
         dim3(std::min(static_cast<int64_t>(cuda::getApplyBlock().x), num_inp));
     dim3 grid;
     int curDevice = -1;
-    cudaGetDevice(&curDevice);
+    c10::cuda::GetDevice(&curDevice);
     cuda::getApplyGrid(num_inp, grid, curDevice);
     adjacent_difference_kernel<<<grid, block, 0, stream>>>(
         num_inp, data, inv_loc_ptr);
@@ -340,6 +338,4 @@ INSTANTIATE_UNIQUE_CUDA_TEMPLATE(at::Half);
 
 #undef INSTANTIATE
 
-} // namespace internal
-} // namespace native
-} // namespace at
+} // namespace at::native::internal

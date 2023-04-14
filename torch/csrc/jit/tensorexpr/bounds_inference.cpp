@@ -10,9 +10,7 @@
 
 #include <c10/util/irange.h>
 
-namespace torch {
-namespace jit {
-namespace tensorexpr {
+namespace torch::jit::tensorexpr {
 
 using namespace analysis;
 
@@ -164,7 +162,7 @@ std::vector<ExprPtr> getBoundExtents(
   std::vector<ExprPtr> starts;
   std::vector<ExprPtr> stops;
 
-  // Find the safe size of the temprorary buffer by determining the outer
+  // Find the safe size of the temporary buffer by determining the outer
   // extents of a union of all bounds.
   for (const TensorAccessBoundsInfo& p : infos) {
     for (const auto i : c10::irange(p.start.size())) {
@@ -229,9 +227,6 @@ HazardKind getPotentialHazards(
     StmtPtr B) {
   BoundsInfo aBounds = getInferredBounds(analyzer, A, true);
   BoundsInfo bBounds = getInferredBounds(analyzer, B, true);
-
-  BoundSet aWrites;
-  BoundSet aReads;
 
   for (auto& pair : bBounds) {
     BufPtr buf = pair.first;
@@ -369,6 +364,4 @@ bool isOverlapping(
   return hasConflictingOverlap(sBounds, lBounds, kStore, kLoad);
 }
 
-} // namespace tensorexpr
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::tensorexpr
