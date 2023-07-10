@@ -4,19 +4,23 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/util/CallOnce.h>
 #include <c10/util/UniqueVoidPtr.h>
 #include <c10/util/flat_hash_map.h>
 #include <c10/util/irange.h>
 #include <c10/util/llvmMathExtras.h>
 
-#if !defined(USE_ROCM) && defined(PYTORCH_EXPANDABLE_SEGMENTS_SUPPORTED)
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
 #include <c10/cuda/driver_api.h>
+#include <sys/types.h>
+#include <unistd.h>
 #endif
 
 #include <c10/util/Exception.h>
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <bitset>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <iostream>
@@ -258,7 +262,7 @@ struct SegmentRange {
   SegmentRange(void* p, size_t s) : ptr(static_cast<char*>(p)), size(s) {}
 };
 
-#if !defined(USE_ROCM) && defined(PYTORCH_EXPANDABLE_SEGMENTS_SUPPORTED)
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
 
 /*
 Note [Expandable Segments]
@@ -359,14 +363,14 @@ struct ExpandableSegment {
       int device,
       cudaStream_t stream,
       size_t size,
-      const std::vector<int>& peers)
+      std::vector<int> peers)
       : device_(device),
         stream_(stream),
         max_handles_(0),
         // 2MB for small pool, 20MB for large pool
         segment_size_(size),
-        peers_(peers) {
-    cudaDeviceProp prop;
+        peers_(std::move(peers)) {
+    cudaDeviceProp prop{};
     C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device_));
     // we allocate enough address space for 1 1/8 the total memory on the GPU.
     // This allows for some cases where we have to unmap pages earlier in the
@@ -387,11 +391,11 @@ struct ExpandableSegment {
       return rangeFromHandles(begin, end);
     }
     while (end > handles_.size()) {
-      handles_.push_back(c10::nullopt);
+      handles_.emplace_back(c10::nullopt);
     }
     for (auto i : c10::irange(begin, end)) {
       TORCH_INTERNAL_ASSERT(!handles_.at(i));
-      CUmemGenericAllocationHandle handle;
+      CUmemGenericAllocationHandle handle = 0;
       CUmemAllocationProp prop = {};
       prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
       prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -520,7 +524,7 @@ struct ExpandableSegment {
   }
   int device_;
   cudaStream_t stream_;
-  CUdeviceptr ptr_;
+  CUdeviceptr ptr_{};
   size_t max_handles_;
   size_t segment_size_;
   std::vector<c10::optional<CUmemGenericAllocationHandle>> handles_;
@@ -558,7 +562,7 @@ struct ExpandableSegment {
 // [Checkpointing PrivatePoolState]
 struct BlockState {
   int device = 0;
-  cudaStream_t stream = 0;
+  cudaStream_t stream = nullptr;
   stream_set stream_uses = {};
   size_t size = 0;
   void* ptr = nullptr;
@@ -712,8 +716,8 @@ struct PrivatePool {
   PrivatePool()
       : use_count(1),
         cudaMalloc_count(0),
-        large_blocks(/*is_small=*/false, this),
-        small_blocks(/*is_small=*/true, this) {}
+        large_blocks(/*small=*/false, this),
+        small_blocks(/*small=*/true, this) {}
   PrivatePool(const PrivatePool&) = delete;
   PrivatePool(PrivatePool&&) = delete;
   PrivatePool& operator=(const PrivatePool&) = delete;
@@ -756,7 +760,7 @@ SegmentState::SegmentState(Block* head) {
 PrivatePoolState::PrivatePoolState(
     MempoolId_t pool_id,
     const std::vector<Block*>& private_pool_head_blocks)
-    : owner_id(pool_id) {
+    : owner_id(std::move(pool_id)) {
   for (Block* head : private_pool_head_blocks) {
     segments.emplace_back(head);
   }
@@ -803,7 +807,7 @@ class CachingAllocatorConfig {
   }
 
   static bool expandable_segments() {
-#ifndef EXPANDABLE_SEGMENTS_SUPPORTED
+#ifndef PYTORCH_C10_DRIVER_API_SUPPORTED
     if (instance().m_expandable_segments) {
       TORCH_WARN_ONCE("expandable_segments not supported on this platform")
     }
@@ -888,7 +892,7 @@ void CachingAllocatorConfig::lexArgs(
   size_t env_length = strlen(env);
   for (size_t i = 0; i < env_length; i++) {
     if (env[i] == ',' || env[i] == ':' || env[i] == '[' || env[i] == ']') {
-      if (buf.size() != 0) {
+      if (!buf.empty()) {
         config.emplace_back(buf.begin(), buf.end());
         buf.clear();
       }
@@ -961,7 +965,7 @@ size_t CachingAllocatorConfig::parseRoundUpPower2Divisions(
     if (config[i].compare("[") == 0) {
       size_t last_index = 0;
       while (++i < config.size() && config[i].compare("]") != 0) {
-        std::string val1 = config[i];
+        const std::string& val1 = config[i];
         size_t val2 = 0;
 
         consumeToken(config, ++i, ':');
@@ -1045,7 +1049,7 @@ size_t CachingAllocatorConfig::parseAllocatorConfig(
     used_cudaMallocAsync = (config[i] == "cudaMallocAsync");
     if (used_cudaMallocAsync) {
 #if CUDA_VERSION >= 11040
-      int version;
+      int version = 0;
       C10_CUDA_CHECK(cudaDriverGetVersion(&version));
       TORCH_CHECK(
           version >= 11040,
@@ -1119,6 +1123,58 @@ void CachingAllocatorConfig::parseArgs(const char* env) {
         "backend:cudaMallocAsync ignores max_split_size_mb, roundup_bypass_threshold_mb,"
         "roundup_power2_divisions, and garbage_collect_threshold.");
   }
+}
+
+static std::string reportProcessMemoryInfo(int device) {
+#ifdef PYTORCH_C10_DRIVER_API_SUPPORTED
+  static c10::once_flag nvml_init;
+  c10::call_once(nvml_init, [] {
+    TORCH_INTERNAL_ASSERT(NVML_SUCCESS == DriverAPI::get()->nvmlInit_v2_());
+  });
+
+  cudaDeviceProp prop{};
+  C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+  char pci_id[80];
+  snprintf(
+      pci_id,
+      sizeof(pci_id),
+      NVML_DEVICE_PCI_BUS_ID_FMT,
+      prop.pciDomainID,
+      prop.pciBusID,
+      prop.pciDeviceID);
+
+  nvmlDevice_t nvml_device = nullptr;
+  TORCH_INTERNAL_ASSERT(
+      NVML_SUCCESS ==
+      DriverAPI::get()->nvmlDeviceGetHandleByPciBusId_v2_(
+          pci_id, &nvml_device));
+
+  std::vector<nvmlProcessInfo_v1_t> procs(8);
+  unsigned int size = procs.size();
+  nvmlReturn_t r;
+  while ((r = DriverAPI::get()->nvmlDeviceGetComputeRunningProcesses_(
+              nvml_device, &size, procs.data())) ==
+         NVML_ERROR_INSUFFICIENT_SIZE) {
+    procs.resize(size);
+  }
+  unsigned int self_pid = getpid();
+  std::stringstream ss;
+  TORCH_INTERNAL_ASSERT(NVML_SUCCESS == r);
+  ss << "";
+  for (auto i : c10::irange(size)) {
+    auto& proc = procs[i];
+    if (self_pid == proc.pid) {
+      ss << "Including non-PyTorch memory, this process";
+    } else {
+      ss << "Process " << proc.pid;
+    }
+    ss << " has " << format_size(proc.usedGpuMemory) << " memory in use. ";
+  }
+  return ss.str();
+#else
+  return "";
+#endif
 }
 
 namespace Native {
@@ -1195,8 +1251,8 @@ class DeviceCachingAllocator {
 
  public:
   DeviceCachingAllocator()
-      : large_blocks(/*is_small=*/false),
-        small_blocks(/*is_small=*/true),
+      : large_blocks(/*small=*/false),
+        small_blocks(/*small=*/true),
         alloc_trace(new std::vector<TraceEntry>()) {
     stats.max_split_size = CachingAllocatorConfig::max_split_size();
     context_recorder_.store(nullptr);
@@ -1214,6 +1270,35 @@ class DeviceCachingAllocator {
     alloc_trace_record_context_ = alloc_trace_record_context;
     alloc_trace_next = 0;
     alloc_trace->clear();
+  }
+
+  bool isHistoryEnabled() {
+    return record_history;
+  }
+
+  bool checkPoolLiveAllocations(
+      MempoolId_t mempool_id,
+      const std::unordered_set<void*>& expected_live_allocations) {
+    std::unique_lock<std::recursive_mutex> lock(mutex);
+
+    PrivatePool* pool = nullptr;
+    auto pool_it = graph_pools.find(mempool_id);
+    TORCH_CHECK(pool_it != graph_pools.end(), "Could not find pool of id");
+    pool = pool_it->second.get();
+
+    size_t allocated_pool_blocks = 0;
+
+    for (Block* b : active_blocks) {
+      if (b->allocated && b->pool->owner_PrivatePool == pool) {
+        if (!expected_live_allocations.count(b->ptr)) {
+          return false;
+        }
+
+        allocated_pool_blocks += 1;
+      }
+    }
+
+    return allocated_pool_blocks == expected_live_allocations.size();
   }
 
   void attachOutOfMemoryObserver(OutOfMemoryObserver observer) {
@@ -1286,14 +1371,16 @@ class DeviceCachingAllocator {
       // alloc_block should have thrown an exception already.
       TORCH_INTERNAL_ASSERT(params.err == cudaErrorMemoryAllocation);
 
-      size_t device_free;
-      size_t device_total;
+      size_t device_free = 0;
+      size_t device_total = 0;
       C10_CUDA_CHECK(cudaMemGetInfo(&device_free, &device_total));
       std::string allowed_info;
 
       if (set_fraction) {
         allowed_info = format_size(allowed_memory_maximum) + " allowed; ";
       }
+
+      std::string proc_info = reportProcessMemoryInfo(device);
 
       if (record_history) {
         record_trace(
@@ -1358,19 +1445,20 @@ class DeviceCachingAllocator {
           false,
           "CUDA out of memory. Tried to allocate ",
           format_size(alloc_size),
-          " (GPU ",
+          ". GPU ",
           device,
-          "; ",
+          " has a total capacty of ",
           format_size(device_total),
-          " total capacity; ",
-          format_size(allocated_bytes),
-          " already allocated; ",
+          " of which ",
           format_size(device_free),
-          " free; ",
-          allowed_info,
-          format_size(reserved_bytes),
-          " reserved in total by PyTorch)",
-          " If reserved memory is >> allocated memory try setting max_split_size_mb to avoid"
+          " is free. ",
+          proc_info,
+          "Of the allocated memory ",
+          format_size(allocated_bytes),
+          " is allocated by PyTorch, and ",
+          format_size(reserved_bytes - allocated_bytes),
+          " is reserved by PyTorch but unallocated.",
+          " If reserved but unallocated memory is large try setting max_split_size_mb to avoid"
           " fragmentation.  See documentation for Memory Management and PYTORCH_CUDA_ALLOC_CONF",
           "");
     }
@@ -1573,8 +1661,8 @@ class DeviceCachingAllocator {
 
   /** set memory fraction to limit maximum allocated memory **/
   void setMemoryFraction(double fraction) {
-    size_t device_free;
-    size_t device_total;
+    size_t device_free = 0;
+    size_t device_total = 0;
     C10_CUDA_CHECK(cudaMemGetInfo(&device_free, &device_total));
     allowed_memory_maximum = static_cast<size_t>(fraction * device_total);
     set_fraction = true;
@@ -1591,7 +1679,7 @@ class DeviceCachingAllocator {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     if (*largest ==
         0) { // make an initial guess if a zero *largest is passed in
-      size_t tmp_bytes;
+      size_t tmp_bytes = 0;
       C10_CUDA_CHECK(cudaMemGetInfo(
           largest, // Use free memory as an optimistic initial guess of *largest
           &tmp_bytes));
@@ -1951,7 +2039,7 @@ class DeviceCachingAllocator {
         });
 
     if (record_history) {
-      record_trace(TraceEntry::SNAPSHOT, 0, total_active, 0, nullptr);
+      record_trace(TraceEntry::SNAPSHOT, 0, total_active, nullptr, nullptr);
     }
     return result;
   }
@@ -2578,7 +2666,7 @@ class DeviceCachingAllocator {
     C10_CUDA_CHECK(cudaGetLastError());
 
     size_t size = p.alloc_size;
-    void* ptr;
+    void* ptr = nullptr;
 
     if (isRetry) {
       stats.num_alloc_retries += 1;
@@ -2613,7 +2701,7 @@ class DeviceCachingAllocator {
           // to catch the exception, free some stuff in their script, and
           // attempt the allocation again. In this case, we can also forgive and
           // clear CUDA's internal error state.
-          cudaGetLastError();
+          (void)cudaGetLastError();
         } else {
           // If the error's unrelated to memory allocation, we should throw
           // immediately.
@@ -2890,7 +2978,7 @@ class DeviceCachingAllocator {
   }
 
   void insert_events(Block* block) {
-    int prev_device;
+    int prev_device = 0;
     C10_CUDA_CHECK(c10::cuda::GetDevice(&prev_device));
 
     stream_set streams(std::move(block->stream_uses));
@@ -2910,7 +2998,7 @@ class DeviceCachingAllocator {
   }
 
   void insert_events_deferred_until_no_capture() {
-    if (C10_UNLIKELY(needs_events_deferred_until_no_capture.size() > 0)) {
+    if (C10_UNLIKELY(!needs_events_deferred_until_no_capture.empty())) {
       for (auto* block : needs_events_deferred_until_no_capture) {
         TORCH_INTERNAL_ASSERT(!block->stream_uses.empty());
         insert_events(block);
@@ -2939,7 +3027,7 @@ class DeviceCachingAllocator {
         cudaError_t err = C10_CUDA_ERROR_HANDLED(cudaEventQuery(*event));
         if (err == cudaErrorNotReady) {
           // ignore and clear the error if not ready
-          cudaGetLastError();
+          (void)cudaGetLastError();
           // Return the ownership of the Event (unique ptr)
           e.first = std::move(event);
           break;
@@ -3053,7 +3141,7 @@ class NativeCachingAllocator : public CUDAAllocator {
   }
 
   bool initialized() override {
-    return device_allocator.size() > 0;
+    return !device_allocator.empty();
   }
 
   /** allocates a block which is safe to use from the provided stream */
@@ -3109,17 +3197,31 @@ class NativeCachingAllocator : public CUDAAllocator {
       CreateContextFn context_recorder,
       size_t alloc_trace_max_entries,
       bool alloc_trace_record_context) override {
-    int device;
+    int device = 0;
     C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
     device_allocator[device]->recordHistory(
         enabled,
-        std::move(context_recorder),
+        context_recorder,
         alloc_trace_max_entries,
         alloc_trace_record_context);
   }
 
+  bool isHistoryEnabled() override {
+    int device = 0;
+    C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
+    return device_allocator[device]->isHistoryEnabled();
+  }
+
+  bool checkPoolLiveAllocations(
+      int device,
+      MempoolId_t mempool_id,
+      const std::unordered_set<void*>& expected_live_allocations) override {
+    return device_allocator[device]->checkPoolLiveAllocations(
+        mempool_id, expected_live_allocations);
+  }
+
   void attachOutOfMemoryObserver(OutOfMemoryObserver observer) override {
-    int device;
+    int device = 0;
     C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
     device_allocator[device]->attachOutOfMemoryObserver(std::move(observer));
   }
@@ -3218,7 +3320,7 @@ class NativeCachingAllocator : public CUDAAllocator {
         OutOfMemoryError,
         size < one_exa_bytes,
         "CUDA out of memory. Tried to allocate more than 1EB memory.");
-    int device;
+    int device = 0;
     C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
     void* r = nullptr;
     if (forceUncachedAllocator()) {
@@ -3295,7 +3397,7 @@ class NativeCachingAllocator : public CUDAAllocator {
     if (nbytes == 0) {
       return nullptr;
     }
-    int device;
+    int device = 0;
     C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
     void* r = nullptr;
     malloc(&r, device, nbytes, cuda::getCurrentCUDAStream(device));
@@ -3306,7 +3408,7 @@ class NativeCachingAllocator : public CUDAAllocator {
     if (nbytes == 0) {
       return nullptr;
     }
-    int device;
+    int device = 0;
     C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
     void* r = nullptr;
     malloc(&r, device, nbytes, stream);
@@ -3318,7 +3420,7 @@ class NativeCachingAllocator : public CUDAAllocator {
     cudaError_t err = cudaDeviceEnablePeerAccess(dev_to_access, 0);
     if (err == cudaErrorPeerAccessAlreadyEnabled) {
       // ignore and clear the error if access was already enabled
-      cudaGetLastError();
+      (void)cudaGetLastError();
     } else {
       C10_CUDA_CHECK(err);
     }
@@ -3383,7 +3485,7 @@ class NativeCachingAllocator : public CUDAAllocator {
     C10_CUDA_CHECK(cudaIpcOpenMemHandle(
         &dev, *ipc_handle, cudaIpcMemLazyEnablePeerAccess));
     // devPtr has to be deleted in same device when created.
-    int curr_device;
+    int curr_device = 0;
     C10_CUDA_CHECK(c10::cuda::GetDevice(&curr_device));
     auto sp =
         std::shared_ptr<void>(dev, [handle, curr_device, this](void* ptr) {
@@ -3424,7 +3526,7 @@ void setAllocatorSettings(const std::string& env) {
 }
 
 // Size pretty-printer
-inline std::string format_size(uint64_t size) {
+std::string format_size(uint64_t size) {
   std::ostringstream os;
   os.precision(2);
   os << std::fixed;
@@ -3489,7 +3591,7 @@ struct BackendStaticInitializer {
   }
 };
 
-std::atomic<CUDAAllocator*> allocator{};
+std::atomic<CUDAAllocator*> allocator;
 BackendStaticInitializer backend_static_initializer;
 
 } // namespace CUDACachingAllocator

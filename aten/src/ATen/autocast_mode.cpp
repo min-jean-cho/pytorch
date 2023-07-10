@@ -3,6 +3,8 @@
 #include <iostream>
 #include <exception>
 #include <mutex>
+#include <ATen/CachedTensorUtils.h>
+#include <c10/util/flat_hash_map.h>
 
 namespace at {
 namespace autocast {
@@ -31,12 +33,28 @@ void set_xpu_enabled(bool new_enabled) {
   c10::impl::tls_set_dispatch_key_excluded(DispatchKey::AutocastXPU, !new_enabled);
 }
 
+bool is_ipu_enabled() {
+  return !c10::impl::tls_is_dispatch_key_excluded(DispatchKey::AutocastIPU);
+}
+
+void set_ipu_enabled(bool new_enabled) {
+  c10::impl::tls_set_dispatch_key_excluded(DispatchKey::AutocastIPU, !new_enabled);
+}
+
 bool is_hpu_enabled() {
   return !c10::impl::tls_is_dispatch_key_excluded(DispatchKey::AutocastHPU);
 }
 
 void set_hpu_enabled(bool new_enabled) {
   c10::impl::tls_set_dispatch_key_excluded(DispatchKey::AutocastHPU, !new_enabled);
+}
+
+bool is_xla_enabled() {
+  return !c10::impl::tls_is_dispatch_key_excluded(DispatchKey::AutocastXLA);
+}
+
+void set_xla_enabled(bool new_enabled) {
+  c10::impl::tls_set_dispatch_key_excluded(DispatchKey::AutocastXLA, !new_enabled);
 }
 
 bool is_privateuseone_enabled() {
@@ -66,8 +84,9 @@ namespace {
 // directly against incoming TensorImpl*s.
 using weakref_type = c10::weak_intrusive_ptr<TensorImpl, UndefinedTensorImpl>;
 using val_type = std::tuple<weakref_type, Tensor>;
-std::unordered_map<TensorImpl*, val_type> cached_casts;
+ska::flat_hash_map<TensorImpl*, val_type> cached_casts;
 std::mutex cached_casts_mutex;
+
 
 // nesting tracks the nesting depth of the Python-side context manager.
 // When the autocast context manager exits to a nesting level that's outside
@@ -81,8 +100,14 @@ thread_local at::ScalarType autocast_cpu_dtype = at::kBFloat16;
 // autocast_xpu_dtype is the lower_precision_fp used by AutocastXPU.
 thread_local at::ScalarType autocast_xpu_dtype = at::kBFloat16;
 
+// autocast_ipu_dtype is the lower_precision_fp used by AutocastIPU.
+thread_local at::ScalarType autocast_ipu_dtype = at::kHalf;
+
 // autocast_hpu_dtype is the lower_precision_fp used by AutocastHPU.
 thread_local at::ScalarType autocast_hpu_dtype = at::kBFloat16;
+
+// autocast_xla_dtype is the lower_precision_fp used by AutocastXLA.
+thread_local at::ScalarType autocast_xla_dtype = at::kBFloat16;
 
 // should we enabled the cache inside autocast.
 thread_local bool cache_enabled = true;
@@ -119,8 +144,16 @@ at::ScalarType get_autocast_xpu_dtype() {
   return autocast_xpu_dtype;
 }
 
+at::ScalarType get_autocast_ipu_dtype() {
+  return autocast_ipu_dtype;
+}
+
 at::ScalarType get_autocast_hpu_dtype() {
   return autocast_hpu_dtype;
+}
+
+at::ScalarType get_autocast_xla_dtype() {
+  return autocast_xla_dtype;
 }
 
 at::ScalarType get_autocast_privateuseone_dtype() {
@@ -142,8 +175,16 @@ void set_autocast_xpu_dtype(at::ScalarType dtype) {
   autocast_xpu_dtype = dtype;
 }
 
+void set_autocast_ipu_dtype(at::ScalarType dtype) {
+  autocast_ipu_dtype = dtype;
+}
+
 void set_autocast_hpu_dtype(at::ScalarType dtype) {
   autocast_hpu_dtype = dtype;
+}
+
+void set_autocast_xla_dtype(at::ScalarType dtype) {
+  autocast_xla_dtype = dtype;
 }
 
 void set_autocast_privateuseone_dtype(at::ScalarType dtype) {
@@ -168,7 +209,9 @@ Tensor cached_cast(at::ScalarType to_type, const Tensor& arg, DeviceType device_
     // See cached_casts declaration above for detailed strategy.
     bool can_try_cache = (to_type == get_lower_precision_fp_from_device_type(device_type) &&
                          arg.scalar_type() == at::kFloat && arg.requires_grad() &&
-                         arg.is_leaf() && !arg.is_view() && cache_enabled);
+                         arg.is_leaf() && !arg.is_view() && cache_enabled &&
+                         !at::caching::is_cached_tensor(arg));
+
     if (can_try_cache) {
       const std::lock_guard<std::mutex> lock(cached_casts_mutex);
       auto it = cached_casts.find(arg.unsafeGetTensorImpl());
@@ -191,7 +234,7 @@ Tensor cached_cast(at::ScalarType to_type, const Tensor& arg, DeviceType device_
 Banned functions
 *******************************/
 
-Tensor binary_cross_entropy_banned(const Tensor &, const Tensor &, const c10::optional<Tensor>&, int64_t) {
+static Tensor binary_cross_entropy_banned(const Tensor &, const Tensor &, const c10::optional<Tensor>&, int64_t) {
   AT_ERROR("torch.nn.functional.binary_cross_entropy and torch.nn.BCELoss are unsafe to autocast.\n"
            "Many models use a sigmoid layer right before the binary cross entropy layer.\n"
            "In this case, combine the two layers using torch.nn.functional.binary_cross_entropy_with_logits\n"

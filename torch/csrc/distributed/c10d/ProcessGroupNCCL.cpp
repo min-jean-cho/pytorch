@@ -26,6 +26,7 @@
 #include <torch/csrc/distributed/c10d/Utils.hpp>
 
 #include <torch/csrc/cuda/nccl.h>
+#include <torch/torch.h>
 
 namespace c10d {
 
@@ -85,12 +86,15 @@ ncclRedOpRAII unpackPreMulSum(
   ncclRedOp_t preMulSum;
   bool has_tensor = preMulSupplement->tensor_factor.defined();
   auto residence = has_tensor ? ncclScalarDevice : ncclScalarHostImmediate;
-  T* ptr_factor =
-      has_tensor ? preMulSupplement->tensor_factor.data_ptr<T>() : nullptr;
+  const T* ptr_factor = has_tensor
+      ? preMulSupplement->tensor_factor.const_data_ptr<T>()
+      : nullptr;
   T scalar_factor = T(preMulSupplement->double_factor);
   ncclRedOpCreatePreMulSum(
       &preMulSum,
-      has_tensor ? ptr_factor : &scalar_factor,
+      // https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/ops.html#ncclredopcreatepremulsum
+      // tells us that the scalar input is strictly a multiplier.
+      /*scalar=*/has_tensor ? const_cast<T*>(ptr_factor) : &scalar_factor,
       dataType,
       residence,
       comm);
@@ -265,8 +269,7 @@ std::string getExceptionMsgFromExceptionPtr(
   }
 }
 
-inline void errorIfCapturingNonCapturableNCCL() {
-  auto status = c10::cuda::currentStreamCaptureStatusMayInitCtx();
+inline void errorIfCapturingNonCapturableNCCL(c10::cuda::CaptureStatus status) {
   // parentheses avoid some compiler warnings
   static const uint64_t min_version =
       (((uint64_t)2) << 32) + (((uint64_t)9) << 16) + ((uint64_t)6);
@@ -288,29 +291,19 @@ std::ostream& operator<<(
     std::ostream& output,
     const ProcessGroupNCCL::WorkNCCL& workNCCL) {
   std::string workInfo;
-  if (workNCCL.outputs_) {
-    workInfo = c10::str(
-        "WorkNCCL(",
-        "SeqNum=",
-        workNCCL.seq_,
-        ", OpType=",
-        opTypeToString(workNCCL.opType_),
-        ", TensorShape=",
-        (*workNCCL.outputs_)[0].sizes(),
-        ", Timeout(ms)=",
-        workNCCL.opTimeout_.count(),
-        ")");
-  } else {
-    workInfo = c10::str(
-        "WorkNCCL(",
-        "SeqNum=",
-        workNCCL.seq_,
-        ", OpType=",
-        opTypeToString(workNCCL.opType_),
-        ", Timeout(ms)=",
-        workNCCL.opTimeout_.count(),
-        ")");
-  }
+  workInfo = c10::str(
+      "WorkNCCL(",
+      "SeqNum=",
+      workNCCL.seq_,
+      ", OpType=",
+      opTypeToString(workNCCL.opType_),
+      ", NumelIn=",
+      workNCCL.numelIn_,
+      ", NumelOut=",
+      workNCCL.numelOut_,
+      ", Timeout(ms)=",
+      workNCCL.opTimeout_.count(),
+      ")");
   return output << workInfo;
 }
 
@@ -350,6 +343,8 @@ ProcessGroupNCCL::WorkNCCL::WorkNCCL(const WorkNCCL& w)
       workStartTime_(w.workStartTime_),
       seq_(w.seq_),
       startTraceUpdated_(w.startTraceUpdated_),
+      numelIn_(w.numelIn_),
+      numelOut_(w.numelOut_),
       store_(w.store_) {
   exception_ = w.exception_;
 }
@@ -432,12 +427,14 @@ bool ProcessGroupNCCL::WorkNCCL::finishedGPUExecutionInternal() const {
   return true;
 }
 
-bool ProcessGroupNCCL::WorkNCCL::checkTimeout() {
+bool ProcessGroupNCCL::WorkNCCL::checkTimeout(
+    c10::optional<std::chrono::milliseconds> timeout) {
   auto currentTimepoint = std::chrono::steady_clock::now();
   auto timeElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       currentTimepoint - workStartTime_);
+  auto workTimeout = timeout ? *timeout : opTimeout_;
 
-  if (timeElapsed < opTimeout_)
+  if (timeElapsed < workTimeout)
     return false;
 
   // Timed out
@@ -473,7 +470,7 @@ void ProcessGroupNCCL::WorkNCCL::handleException(
     LOG(ERROR) << exceptionMsg;
     C10_LOG_API_USAGE_ONCE("ProcessGroupNCCL.WorkNCCL.handleException");
 
-    if (errorHandling == TearDown) {
+    if (SHOULD_TEAR_DOWN(errorHandling)) {
       auto tearDownMsg = c10::str(
           "To avoid data inconsistency, we are taking the entire process down.");
       LOG(ERROR) << tearDownMsg;
@@ -508,7 +505,8 @@ void ProcessGroupNCCL::WorkNCCL::synchronizeInternal(
   // In case of blocking, wait for the operation to complete.
   if (blockingWait_) {
     while (!isCompleted()) {
-      bool timedOut = checkTimeout();
+      bool timedOut = checkTimeout(
+          timeout == kNoTimeout ? c10::nullopt : c10::make_optional(timeout));
       // Explicitly abort ncclComms here before throwing this timed out
       // exception to users.
       // If throwing timed out excepiton without aborting nccl communicators
@@ -775,12 +773,14 @@ uint64_t ProcessGroupNCCL::getSequenceNumberForGroup() {
   return seq_;
 }
 
-// Abort all communicators on this rank
-void ProcessGroupNCCL::abort(c10::optional<std::string> abortReason) {
-  std::lock_guard<std::mutex> lock(mutex_);
+void abortCommsFromMap(
+    std::unordered_map<std::string, std::vector<std::shared_ptr<NCCLComm>>>&
+        ncclCommsMap,
+    const int rank,
+    c10::optional<std::string> abortReason) {
   // The process may control multiple devices, loop through the communicators on
   // each device
-  for (auto& it : devNCCLCommMap_) {
+  for (auto& it : ncclCommsMap) {
     auto& devName = it.first;
     auto& ncclComms = it.second;
 
@@ -797,9 +797,16 @@ void ProcessGroupNCCL::abort(c10::optional<std::string> abortReason) {
     // their responsibility to destroy the process group and recreate
     // it to recover from errors.
 
-    LOG(INFO) << "[Rank " << rank_ << "] Destroyed " << ncclComms.size()
+    LOG(INFO) << "[Rank " << rank << "] Destroyed " << ncclComms.size()
               << "communicators on CUDA device " << devName;
   }
+}
+
+// Abort all communicators on this rank
+void ProcessGroupNCCL::abort(c10::optional<std::string> abortReason) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  abortCommsFromMap(devNCCLCommMap_, rank_, abortReason);
+  abortCommsFromMap(inInitializationCommMap_, rank_, abortReason);
 }
 
 ProcessGroupNCCL::~ProcessGroupNCCL() {
@@ -886,11 +893,13 @@ void ProcessGroupNCCL::workCleanupLoop() {
 
       // If work hits an exception (either an error or timeout)
       if (work.exception()) {
-        // Abort work and corresponding communicators
-        work.abort();
-        // PG level abort, which would abort all other communicators on this
-        // rank
-        abort();
+        if (SHOULD_CLEAN_UP(asyncErrorHandling_)) {
+          // Abort work and corresponding communicators
+          work.abort();
+          // PG level abort, which would abort all other communicators on this
+          // rank
+          abort();
+        }
         // Report desync state in case of timeout
         if (desyncDebug_ && timedOut) {
           try {
@@ -1150,11 +1159,20 @@ std::vector<std::shared_ptr<NCCLComm>>& ProcessGroupNCCL::getNCCLComm(
     int deviceIndex = devices[i].index();
 
     gpuGuard.set_index(deviceIndex);
+#ifdef NCCL_HAS_COMM_NONBLOCKING
+    ncclComms[i] = NCCLComm::create(numRanks, rank, ncclID, options_->config);
+#else
     ncclComms[i] = NCCLComm::create(numRanks, rank, ncclID);
+#endif
 
     // Creates the NCCL streams
     streamVal.push_back(
         at::cuda::getStreamFromPool(options_->is_high_priority_stream));
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    inInitializationCommMap_.emplace(devicesKey, ncclComms);
   }
 
   // [Note 2 ]
@@ -1198,8 +1216,18 @@ std::vector<std::shared_ptr<NCCLComm>>& ProcessGroupNCCL::getNCCLComm(
   ncclIdToCommMap_.emplace(buildNcclUniqueIdStr(ncclID), ncclComms);
 
   // Move the NCCL resource to cache
-  devNCCLCommMap_.emplace(devicesKey, std::move(ncclComms));
-  return devNCCLCommMap_[devicesKey];
+  auto it = inInitializationCommMap_.find(devicesKey);
+  // A previous thread could've already removed devicesKey from
+  // inInitializationCommMap_ and added it to devNCCLCommMap_
+  if (it != inInitializationCommMap_.end()) {
+    devNCCLCommMap_.emplace(devicesKey, std::move(it->second));
+    inInitializationCommMap_.erase(devicesKey);
+  }
+
+  it = devNCCLCommMap_.find(devicesKey);
+  TORCH_INTERNAL_ASSERT(
+      it != devNCCLCommMap_.end(), "Communicators not populated in cache!");
+  return it->second;
 }
 
 namespace {
@@ -1389,44 +1417,66 @@ ProcessGroupNCCL::Options::Options(bool is_high_priority_stream)
     : Backend::Options(NCCL_BACKEND_NAME),
       is_high_priority_stream(is_high_priority_stream) {}
 
+static constexpr int CoalActive = 0x01, CoalColl = 0x02, CoalP2P = 0x04;
+
 void ProcessGroupNCCL::startCoalescing() {
   coalescedDevices_.clear();
-  coalescing_active_ = true;
+  coalescedComms_.clear();
+  coalescing_state_ |= CoalActive;
   groupStart();
 }
 
-void ProcessGroupNCCL::endCoalescing(
-    std::vector<c10::intrusive_ptr<Work>>& reqs) {
-  if (!nccl_use_nonblocking()) {
+c10::intrusive_ptr<Work> ProcessGroupNCCL::endCoalescing() {
+  if (!nccl_use_nonblocking() ||
+      coalescedComms_.size() == 0) { // There is no actual work being coalesced
     groupEnd();
   } else {
-    std::vector<std::shared_ptr<NCCLComm>> ncclComms_;
-    for (const auto& req : reqs) {
-      auto ncclWork = static_cast<ProcessGroupNCCL::WorkNCCL*>(req.get());
-      ncclComms_.insert(
-          ncclComms_.end(),
-          ncclWork->ncclComms_.begin(),
-          ncclWork->ncclComms_.end());
-    }
-    groupEndNonblocking(ncclComms_);
-  }
-  if (reqs.size() != coalescedDevices_.size()) {
-    TORCH_CHECK(false, "Number of requests do not match number of collectives");
+    // `coalescedComms_` should have same set of comms across collectives
+    auto comms = coalescedComms_[0];
+    groupEndNonblocking(comms);
   }
 
-  int batch_idx = 0;
-  for (const auto& req : reqs) {
-    auto ncclWork = static_cast<ProcessGroupNCCL::WorkNCCL*>(req.get());
-    // @lint-ignore CLANGTIDY
-    std::vector<at::Device> devices = coalescedDevices_[batch_idx];
-    const auto key = getKeyFromDevices(devices);
-    auto& ncclStreams = ncclStreams_[key];
-    for (const auto i : c10::irange(devices.size())) {
-      (*ncclWork->ncclEndEvents_)[i].record(ncclStreams[i]);
-    }
-    batch_idx += 1;
+  coalescing_state_ = 0;
+
+  if (coalescedDevices_.size() == 0) {
+    // There is no actual work being coalesced
+    return nullptr;
   }
-  coalescing_active_ = false;
+
+  // `coalescedDevices_` should have same set of devices across collectives
+  auto devices = coalescedDevices_[0];
+
+  // Create Work object
+  auto work = initWork(
+      devices, rank_, OpType::COALESCED, "nccl:coalesced", c10::nullopt);
+
+  // Record stream event
+  // `getKeyFromDevices` is how we get keys for both collectives and batch P2P
+  const auto key = getKeyFromDevices(devices);
+  auto& ncclStreams = ncclStreams_[key];
+  for (const auto i : c10::irange(devices.size())) {
+    auto& devEvent = (*work->ncclEndEvents_)[i];
+    devEvent.record(ncclStreams[i]);
+  }
+
+  // Set appropriate work parameters.
+  work->blockingWait_ = blockingWait_;
+  work->avoidRecordStreams_ = avoidRecordStreams_;
+  work->opTimeout_ = options_->timeout;
+  work->store_ = store_;
+
+  c10::cuda::CaptureStatus capture_status =
+      c10::cuda::currentStreamCaptureStatusMayInitCtx();
+
+  if ((coalescing_state_ & CoalColl) &&
+      capture_status == c10::cuda::CaptureStatus::None) {
+    workEnqueue(work);
+    // TODO: it seems we never enqueue work for single send/recv or batch P2P,
+    // see the `pointToPoint` function. This should be fixed. Otherwise, we risk
+    // not being able to abort hanged P2P ops.
+  }
+
+  return work;
 }
 
 template <typename Fn, typename PreProcess, typename PostProcess>
@@ -1438,7 +1488,9 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collective(
     PostProcess post,
     OpType opType,
     const char* profilingTitle) {
-  errorIfCapturingNonCapturableNCCL();
+  c10::cuda::CaptureStatus capture_status =
+      c10::cuda::currentStreamCaptureStatusMayInitCtx();
+  errorIfCapturingNonCapturableNCCL(capture_status);
 
   // Bump collective counter
   seq_++;
@@ -1460,8 +1512,10 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collective(
   const auto key = getKeyFromDevices(devices);
   auto& ncclComms = getNCCLComm(key, devices, opType);
 
-  if (coalescing_active_) {
+  if (coalescing_state_ & CoalActive) {
+    coalescing_state_ |= CoalColl;
     coalescedDevices_.push_back(devices);
+    coalescedComms_.push_back(ncclComms);
   }
 
   // Used many times below, so we stash the unordered_map lookup
@@ -1527,8 +1581,17 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collective(
       //
       // See [Sync Streams].
       if (!avoidRecordStreams_) {
-        c10::cuda::CUDACachingAllocator::recordStream(
-            inputs[i].storage().data_ptr(), ncclStream);
+        if (!inputs[i].is_sparse()) {
+          c10::cuda::CUDACachingAllocator::recordStream(
+              inputs[i].storage().data_ptr(), ncclStream);
+        } else {
+          // for sparse input case record streams on both index and value
+          // tensors
+          c10::cuda::CUDACachingAllocator::recordStream(
+              inputs[i].values().storage().data_ptr(), ncclStream);
+          c10::cuda::CUDACachingAllocator::recordStream(
+              inputs[i].indices().storage().data_ptr(), ncclStream);
+        }
       }
 #ifndef NCCL_HAS_COMM_NONBLOCKING
       C10D_NCCL_CHECK(
@@ -1542,12 +1605,12 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collective(
 #endif
     }
   }
-  post(ncclStreams);
+  post(ncclStreams, work);
 
   // End event should only be recorded after the ncclGroupEnd()
   for (const auto i : c10::irange(devices.size())) {
     at::cuda::CUDAStream& ncclStream = ncclStreams[i];
-    if (!coalescing_active_) {
+    if (!coalescing_state_) {
       (*work->ncclEndEvents_)[i].record(ncclStream);
     }
     work->ncclComms_[i] = ncclComms[i];
@@ -1574,8 +1637,14 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collective(
   work->avoidRecordStreams_ = avoidRecordStreams_;
   work->opTimeout_ = options_->timeout;
   work->store_ = store_;
+  // Record size info for debug. We only record the size on the first device as
+  // multi-device per process is deprecated
+  work->numelIn_ = inputs[0].numel();
+  work->numelOut_ = outputs[0].numel();
 
-  workEnqueue(work);
+  if (!coalescing_state_ && capture_status == c10::cuda::CaptureStatus::None) {
+    workEnqueue(work);
+  }
 
   return work;
 }
@@ -1623,8 +1692,10 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
   }
   auto& ncclComms = getNCCLComm(key, devices, opType, p2pRank, isSendRecvSelf);
 
-  if (coalescing_active_) {
+  if (coalescing_state_ & CoalActive) {
+    coalescing_state_ |= CoalP2P;
     coalescedDevices_.push_back(devices);
+    coalescedComms_.push_back(ncclComms);
   }
 
   // First let NCCL streams wait for input tensors allocation streams
@@ -1707,7 +1778,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
   // End event should only be recorded after the ncclGroupEnd()
   for (const auto i : c10::irange(tensors.size())) {
     at::cuda::CUDAStream& ncclStream = ncclStreams_[key][i];
-    if (!coalescing_active_) {
+    if (!coalescing_state_) {
       (*work->ncclEndEvents_)[i].record(ncclStream);
     }
     work->ncclComms_[i] = ncclComms[i];
@@ -1715,6 +1786,10 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
     work->opTimeout_ = options_->timeout;
     work->store_ = store_;
   }
+
+  // Record size info for debug. We only record the size on the first device as
+  // multi-device per process is deprecated
+  work->numelIn_ = work->numelOut_ = tensors[0].numel();
 
   // Future only needs to be created and marked completed with outputs for
   // recv(), but still create future for use cases such as profiling even for
@@ -1751,7 +1826,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collective(
       fn,
       [](std::vector<at::cuda::CUDAStream>&,
          c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL>& work) {},
-      [](std::vector<at::cuda::CUDAStream>&) {},
+      [](std::vector<at::cuda::CUDAStream>&,
+         c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL>& work) {},
       opType,
       profilingTitle);
 }
@@ -1772,6 +1848,82 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::pointToPoint(
          c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL>& work) {},
       [](std::vector<at::cuda::CUDAStream>&) {},
       profilingTitle);
+}
+
+c10::intrusive_ptr<Work> ProcessGroupNCCL::allreduce_sparse(
+    std::vector<at::Tensor>& tensors,
+    const AllreduceOptions& opts) {
+#ifdef IS_NCCL_EXP
+  std::vector<at::Tensor> outputTensors(tensors.size());
+  for (std::vector<at::Tensor>::size_type i = 0; i < tensors.size(); i++) {
+    tensors[i] = tensors[i].coalesce();
+    outputTensors[i] = torch::zeros(
+        tensors[i].sizes(), tensors[i].options().layout(torch::kStrided));
+  }
+  int dev_in_group = 0;
+  auto work = collective(
+      tensors,
+      outputTensors,
+      [&](at::Tensor& input,
+          at::Tensor& output,
+          ncclComm_t comm,
+          at::cuda::CUDAStream& stream) {
+        auto ncclDataType = getNcclDataType(input.scalar_type());
+        auto ncclReduceOp = getNcclReduceOp(
+            opts.reduceOp, input, ncclDataType, comm, dev_in_group++);
+
+        size_t num_elements = output.numel();
+        auto indices = input.indices();
+        auto sizes = input.sizes();
+        int colSize = sizes[1];
+        auto rows = indices[0];
+        size_t blockCount = rows.sizes()[0];
+        auto recvIndices = indices[0] * colSize;
+
+        // prevent output and recvIndices from being freed
+        c10::cuda::CUDACachingAllocator::recordStream(
+            output.storage().data_ptr(), stream);
+        c10::cuda::CUDACachingAllocator::recordStream(
+            recvIndices.storage().data_ptr(), stream);
+        auto result = ncclAllReduceSparseBlock(
+            input._values().data_ptr(), // sendbuff
+            recvIndices.data_ptr<int64_t>(), // recv_indices
+            blockCount, // block_count
+            colSize, // block_length
+            output.data_ptr(), // recvbuff
+            output.numel(), // recv_count
+            ncclDataType,
+            ncclReduceOp,
+            comm,
+            stream.stream());
+        return result;
+      },
+      [](std::vector<at::cuda::CUDAStream>& ncclStreams,
+         c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL>& work) {},
+      [&](std::vector<at::cuda::CUDAStream>& ncclStreams,
+          c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL>& work) {
+        // Convert output tensors to sparse and back into tensors.
+        for (const auto i : c10::irange(outputTensors.size())) {
+          at::cuda::CUDAStreamGuard guard(ncclStreams[i]);
+          if (opts.sparseIndices.has_value()) {
+            tensors[i] = at::sparse_coo_tensor(
+                opts.sparseIndices.value(),
+                outputTensors[i],
+                tensors[i].sizes());
+          } else {
+            tensors[i] = outputTensors[i].to_sparse();
+          }
+        }
+      },
+      OpType::_ALLREDUCE_SPARSE,
+      "nccl:all_reduce_sparse");
+  return work;
+#else
+  // If the nccl branch is not "exp" then we just error
+  TORCH_CHECK(
+      false,
+      "allreduce_sparse is only available in the NCCL experimental branch.");
+#endif
 }
 
 c10::intrusive_ptr<Work> ProcessGroupNCCL::allreduce_impl(
@@ -2125,7 +2277,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::allgather(
           // released back to their allocation streams until after work_ is
           // waited on.
         },
-        [&](std::vector<at::cuda::CUDAStream>& ncclStreams) {
+        [&](std::vector<at::cuda::CUDAStream>& ncclStreams,
+            c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL>& work) {
           // Copy the flattened output tensors to the outputs.
           for (const auto i : c10::irange(outputTensors.size())) {
             at::cuda::CUDAStreamGuard guard(ncclStreams[i]);
@@ -2165,8 +2318,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::allgather(
           _broadcast_oop(outputs_multi_dev, inputs_multi_dev, broadcastOpts);
       works.push_back(work);
     }
-    endCoalescing(works);
-    return initCoalescedWork(works, rank_, OpType::BROADCAST);
+    auto work = endCoalescing();
+    return work;
   }
 }
 
@@ -2175,6 +2328,29 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::allgather_coalesced(
     std::vector<at::Tensor>& /* unused */,
     const AllgatherOptions& /* unused */) {
   TORCH_CHECK(false, "ProcessGroupNCCL does not support allgather_coalesced");
+}
+
+c10::intrusive_ptr<Work> ProcessGroupNCCL::allgather_into_tensor_coalesced(
+    std::vector<at::Tensor>& outputs,
+    std::vector<at::Tensor>& inputs,
+    const AllgatherOptions& opts) {
+  return collective(
+      inputs,
+      outputs,
+      [&](at::Tensor& input,
+          at::Tensor& output,
+          ncclComm_t comm,
+          at::cuda::CUDAStream& stream) {
+        return ncclAllGather(
+            input.data_ptr(),
+            output.data_ptr(),
+            input.numel(),
+            getNcclDataType(input.scalar_type()),
+            comm,
+            stream.stream());
+      },
+      OpType::COALESCED,
+      "nccl:all_gather_into_tensor_coalesced");
 }
 
 c10::intrusive_ptr<Work> ProcessGroupNCCL::reduce_scatter(
@@ -2263,7 +2439,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::reduce_scatter(
             }
           }
         },
-        [&](std::vector<at::cuda::CUDAStream>&) {},
+        [&](std::vector<at::cuda::CUDAStream>&,
+            c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL>& work) {},
         OpType::REDUCE_SCATTER,
         "nccl:reduce_scatter");
   } else {
@@ -2290,8 +2467,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::reduce_scatter(
       auto work = _reduce_oop(outputs_multi_dev, inputs_multi_dev, reduceOpts);
       works.push_back(work);
     }
-    endCoalescing(works);
-    return initCoalescedWork(works, rank_, OpType::REDUCE);
+    auto work = endCoalescing();
+    return work;
   }
 }
 
@@ -2356,11 +2533,39 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::_reduce_scatter_base(
             comm,
             stream.stream());
       },
-      [](std::vector<at::cuda::CUDAStream>&,
-         c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL>& work) {},
-      [](std::vector<at::cuda::CUDAStream>&) {},
       OpType::_REDUCE_SCATTER_BASE,
       "nccl:_reduce_scatter_base");
+}
+
+c10::intrusive_ptr<Work> ProcessGroupNCCL::reduce_scatter_tensor_coalesced(
+    std::vector<at::Tensor>& outputs,
+    std::vector<at::Tensor>& inputs,
+    const ReduceScatterOptions& opts) {
+  return collective(
+      inputs,
+      outputs,
+      [&](at::Tensor& input,
+          at::Tensor& output,
+          ncclComm_t comm,
+          at::cuda::CUDAStream& stream) {
+        if (!avoidRecordStreams_) {
+          c10::cuda::CUDACachingAllocator::recordStream(
+              output.storage().data_ptr(), stream);
+        }
+        auto ncclDataType = getNcclDataType(input.scalar_type());
+        auto ncclReduceOp = getNcclReduceOp(
+            opts.reduceOp, input, ncclDataType, comm, /*dev_in_group=*/0);
+        return ncclReduceScatter(
+            input.data_ptr(),
+            output.data_ptr(),
+            output.numel(),
+            ncclDataType,
+            ncclReduceOp,
+            comm,
+            stream.stream());
+      },
+      OpType::COALESCED,
+      "nccl:reduce_scatter_tensor_coalesced");
 }
 
 c10::intrusive_ptr<Work> ProcessGroupNCCL::barrier(const BarrierOptions& opts) {
@@ -2572,7 +2777,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::alltoall(
           v->insert(v->end(), outputTensors.begin(), outputTensors.end());
         }
       },
-      [](std::vector<at::cuda::CUDAStream>&) {},
+      [](std::vector<at::cuda::CUDAStream>&,
+         c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL>& work) {},
       OpType::ALLTOALL);
 }
 
@@ -2919,9 +3125,6 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::_allgather_base(
             comm,
             stream.stream());
       },
-      [&](std::vector<at::cuda::CUDAStream>&,
-          c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL>& work) {},
-      [&](std::vector<at::cuda::CUDAStream>&) {},
       OpType::_ALLGATHER_BASE,
       "nccl:_all_gather_base");
 }

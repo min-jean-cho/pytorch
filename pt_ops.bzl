@@ -1,4 +1,4 @@
-load("@fbsource//tools/build_defs:fb_native_wrapper.bzl", "fb_native")
+load("//tools/build_defs:fb_native_wrapper.bzl", "fb_native")
 load("//tools/build_defs:expect.bzl", "expect")
 load("//tools/build_defs:fb_xplat_genrule.bzl", "fb_xplat_genrule")
 load("//tools/build_defs:type_defs.bzl", "is_list", "is_string")
@@ -332,9 +332,11 @@ PT_OPS_PRIM = [
     "aten::copy_.float",
     "aten::backward",
     "aten::index.Tensor_hacked_twin",
+    "aten::_unsafe_index.Tensor_hacked_twin",
     "aten::_index_put_impl_.hacked_twin",
     "aten::index_put_.hacked_twin",
     "aten::index_put.hacked_twin",
+    "aten::_unsafe_index_put.hacked_twin",
     "aten::to.prim_Device",
     "aten::to.prim_dtype",
     "prim::is_cuda",

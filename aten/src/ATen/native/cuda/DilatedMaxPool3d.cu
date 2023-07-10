@@ -21,7 +21,6 @@
 #include <ATen/ops/empty.h>
 #include <ATen/ops/max_pool3d_with_indices_native.h>
 #include <ATen/ops/max_pool3d_with_indices_backward_native.h>
-#include <ATen/ops/zeros_like.h>
 #endif
 
 namespace at::native {
@@ -314,7 +313,7 @@ void max_pool3d_with_indices_out_cuda_template(
                  stride.size() == 1 ? dT : safe_downcast<int, int64_t>(stride[2]);
 
   TORCH_CHECK(padding.size() == 1 || padding.size() == 3,
-    "max_pool3d: padding must be either be a single int, or a tuple of three ints");
+    "max_pool3d: padding must either be a single int, or a tuple of three ints");
   const int pT = safe_downcast<int, int64_t>(padding[0]);
   const int pH = padding.size() == 1 ? pT : safe_downcast<int, int64_t>(padding[1]);
   const int pW = padding.size() == 1 ? pT : safe_downcast<int, int64_t>(padding[2]);
@@ -444,7 +443,7 @@ void max_pool3d_with_indices_backward_out_cuda_template(
                  stride.size() == 1 ? dT : safe_downcast<int, int64_t>(stride[2]);
 
   TORCH_CHECK(padding.size() == 1 || padding.size() == 3,
-    "max_pool3d: padding must be either be a single int, or a tuple of three ints");
+    "max_pool3d: padding must either be a single int, or a tuple of three ints");
   const int pT = safe_downcast<int, int64_t>(padding[0]);
   const int pH = padding.size() == 1 ? pT : safe_downcast<int, int64_t>(padding[1]);
   const int pW = padding.size() == 1 ? pT : safe_downcast<int, int64_t>(padding[2]);
@@ -636,7 +635,7 @@ Tensor max_pool3d_with_indices_backward_cuda(
   // See Note [Writing Nondeterministic Operations]
   // Nondeterministic because of atomicAdd usage
   globalContext().alertNotDeterministic("max_pool3d_with_indices_backward_cuda");
-  auto gradInput = at::zeros_like(input, input.suggest_memory_format());
+  auto gradInput = at::empty(input.sizes(), input.options());
   max_pool3d_with_indices_backward_out_cuda_template(
     gradInput,
     gradOutput,

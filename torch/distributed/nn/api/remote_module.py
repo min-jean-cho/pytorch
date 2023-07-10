@@ -65,6 +65,7 @@ _REMOTE_MODULE_ATTRIBUTES_IGNORE_FOR_PICKLING = (
     "_is_full_backward_hook",
     "_forward_hooks",
     "_forward_hooks_with_kwargs",
+    "_forward_hooks_always_called",
     "_forward_pre_hooks",
     "_forward_pre_hooks_with_kwargs",
     "_state_dict_hooks",
@@ -394,6 +395,7 @@ class _RemoteModule(nn.Module):
         self,
         state_dict: Mapping[str, Any],
         strict: bool = True,
+        assign: bool = False,
     ):
         _raise_not_supported(self.load_state_dict.__name__)
 

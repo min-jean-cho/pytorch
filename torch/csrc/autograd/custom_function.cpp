@@ -46,7 +46,7 @@ Variable VariableInfo::zeros(at::OptionalDeviceGuard& device_guard) const {
 //  sure that its
 //    forward grad was also modified inplace and already present on the
 //    corresponding output.
-void _process_forward_mode_AD(
+static void _process_forward_mode_AD(
     const variable_list& inputs,
     std::unordered_map<at::TensorImpl*, size_t> inputs_mapping,
     const at::ArrayRef<c10::optional<Variable>> raw_outputs,
@@ -247,7 +247,7 @@ void _process_forward_mode_AD(
   }
 }
 
-at::Tensor _view_as_self_with_no_grad(at::Tensor self) {
+static at::Tensor _view_as_self_with_no_grad(at::Tensor self) {
   // This is called below in _process_backward_mode_ad in two places:
   //
   // (1) An input has been returned, but it wasn't modified. Return it as a view
@@ -268,7 +268,7 @@ at::Tensor _view_as_self_with_no_grad(at::Tensor self) {
   return self.view_as(self);
 }
 
-optional_variable_list _process_backward_mode_ad(
+static optional_variable_list _process_backward_mode_ad(
     const std::unordered_map<at::TensorImpl*, size_t>& inputs_mapping,
     const std::unordered_set<at::TensorImpl*>& non_differentiable,
     const std::unordered_set<at::TensorImpl*>& dirty_inputs,
@@ -363,7 +363,8 @@ optional_variable_list _process_backward_mode_ad(
   int num_diff_outputs = 0;
 
   for (const auto i : c10::irange(num_outputs)) {
-    // For outputs that are not tensors, put a placeholder undefined input.
+    // We put a undefined_input placeholder for outputs that are not tensor and
+    // for when the output tensor is not differentiable (see below)
     if (!raw_outputs[i].has_value()) {
       if (cdata) {
         auto output_nr = cdata->add_input_metadata(Node::undefined_input());
@@ -385,7 +386,12 @@ optional_variable_list _process_backward_mode_ad(
         to_save_if_setup_context.count(out_tensor_impl) > 0;
 
     if (cdata) {
-      auto output_nr = cdata->add_input_metadata(var);
+      auto output_nr = -1;
+      if (!is_differentiable) {
+        output_nr = cdata->add_input_metadata(Node::undefined_input());
+      } else {
+        output_nr = cdata->add_input_metadata(var);
+      }
       AT_ASSERT(i == (int)output_nr);
     }
     set_history(
